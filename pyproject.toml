@@ -60,6 +60,9 @@ docs = [
 bench = [
     "pyperf>=2.6",
 ]
+gcs = [
+    "google-cloud-storage"
+]
 
 [project.urls]
 Homepage = "https://quarantine-py.aritro.cloud"
