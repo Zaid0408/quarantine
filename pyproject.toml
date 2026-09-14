@@ -44,6 +44,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "hypothesis>=6.100",
     "boto3>=1.35",
+    "google-cloud-storage>=2.10",
     "moto[s3,server]>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
