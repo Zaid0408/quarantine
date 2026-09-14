@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-import sys
-import uuid
 import os
+import sys
+import urllib.error
+import urllib.request
+import uuid
+
 import pytest
+from google.auth.credentials import AnonymousCredentials
+from google.cloud import storage
 
 from quarantine import Quarantine, StorageBackend, open_store, quarantine, register_backend, retry
 from quarantine.core import Config
@@ -13,57 +18,286 @@ from quarantine.errors import StorageError
 from quarantine.gcs_store import GCSStore
 from quarantine.store import coerce_dir
 
-from google.auth.credentials import AnonymousCredentials
-from google.cloud import storage
-
-
 BUCKET = "quarantine-test-bucket-gcs"
+EMULATOR_HOST = os.environ.get("STORAGE_EMULATOR_HOST", "http://localhost:4443")
 
 SOURCE = """
-some_source_data = 100 
+FAIL_ON = {"bad", "worse"}
+
+
+def load(item):
+    if item in FAIL_ON:
+        raise ValueError(f"cannot load {item}")
+    return item.upper()
 """
 
-def _client():
-    """Helper method to instantiate the GCS client pointed at the emulator.
-    
-    Using AnonymousCredentials prevents the library from attempting to load 
-    real Google application default credentials from your local machine.
-    """
-    return storage.Client(
-        credentials=AnonymousCredentials(),
-        project="test-project"
-    )
-    
-@pytest.fixture(autouse=True)
-def setup_gcs_emulator_env(monkeypatch):
-    """Automatically ensures the client routing environment variables are set.
-    
-    This replaces the AWS credential monkeypatching from your S3 setup.
-    """
-    # Force the google-cloud-storage library to route requests to the local Docker container
-    monkeypatch.setenv("STORAGE_EMULATOR_HOST", "http://localhost:4443")
-    
+
+def _emulator_reachable() -> bool:
+    """Ping fake-gcs-server once; cached so every test doesn't pay the round trip."""
+    try:
+        urllib.request.urlopen(f"{EMULATOR_HOST}/storage/v1/b", timeout=1)  # noqa: S310
+    except (urllib.error.URLError, ConnectionError, OSError):
+        return False
+    return True
+
+
+_EMULATOR_UP = _emulator_reachable()
+
+pytestmark = [
+    pytest.mark.filterwarnings(
+        "ignore:Type google._upb._message:DeprecationWarning"
+    ),
+    pytest.mark.skipif(
+        not _EMULATOR_UP,
+        reason=(
+            f"fake-gcs-server not reachable at {EMULATOR_HOST} - "
+            f"run `docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http`"
+        ),
+    ),
+]
+
+
 @pytest.fixture
 def module(target_module):
     return target_module(SOURCE, name="qtarget_gcs")
 
 @pytest.fixture
-def gcs_url():
-    """A mocked bucket plus a unique prefix, so tests cannot see each other.
-    
-    Mirrors your s3_url fixture by setting up the mock state on fake-gcs-server.
+def gcs_url(monkeypatch):
+    """A real bucket on the emulator plus a unique prefix, so tests cannot see each other.
     """
+    monkeypatch.setenv("STORAGE_EMULATOR_HOST", EMULATOR_HOST)
     client = _client()
-    
-    # Create the bucket in the emulator if it doesn't exist yet
-    if not client.lookup_bucket(BUCKET):
+    if client.lookup_bucket(BUCKET) is None:
         client.create_bucket(BUCKET)
-        
-    # Return the target path using the official cloud URI scheme
     yield f"gs://{BUCKET}/{uuid.uuid4().hex}"
+
 
 @pytest.fixture
 def gcs(gcs_url):
-    """Returns an instance of your custom GCS storage module."""
-    # Assuming GCSStore initializes using a gs:// path like your S3Store did
     return GCSStore(gcs_url)
+
+def _client() -> storage.Client:
+    """A raw client for asserting against/poking the emulator directly, bypassing GCSStore."""
+    return storage.Client(credentials=AnonymousCredentials(), project="test-project")
+
+
+def _put_raw(key: str, data: bytes = b"") -> None:
+    """Write an object directly, bypassing GCSStore - for simulating another worker's writes."""
+    _client().bucket(BUCKET).blob(key).upload_from_string(data)
+
+
+def _list_raw(prefix: str) -> list[str]:
+    return [blob.name for blob in _client().list_blobs(BUCKET, prefix=prefix)]
+
+
+# -- URL routing ----------------------------------------------------------
+
+
+def test_coerce_dir_keeps_urls_and_paths_apart(tmp_path):
+    from pathlib import Path
+
+    assert coerce_dir("gs://bucket/prefix") == "gs://bucket/prefix"
+    assert coerce_dir(tmp_path) == tmp_path
+    assert coerce_dir("plain/folder") == Path("plain/folder")
+    assert str(coerce_dir(None)).endswith(".quarantine")
+
+
+def test_open_store_picks_the_backend_by_scheme(gcs_url, tmp_path):
+    assert isinstance(open_store(tmp_path), StorageBackend)
+    assert isinstance(open_store(gcs_url), GCSStore)
+
+
+def test_unknown_schemes_fail_with_directions():
+    with pytest.raises(StorageError, match="register_backend"):
+        open_store("carrierpigeon://coop/roost")
+
+
+def test_third_parties_can_register_a_scheme(tmp_path):
+    from quarantine.store import Store
+
+    register_backend("carrierpigeon", lambda url: Store(tmp_path))
+    try:
+        assert open_store("carrierpigeon://coop/roost").dir == tmp_path
+    finally:
+        from quarantine.store import _BACKENDS
+
+        _BACKENDS.pop("carrierpigeon", None)
+
+
+def test_config_does_not_mangle_urls():
+    config = Config(dir="gs://bucket/team/quarantine", halt_after=None)
+    assert config.dir == "gs://bucket/team/quarantine", "Path() would eat the //"
+
+
+def test_the_environment_variable_accepts_a_url(monkeypatch):
+    monkeypatch.setenv("QUARANTINE_DIR", "gs://bucket/from-env")
+    from quarantine.store import default_dir
+
+    assert default_dir() == "gs://bucket/from-env"
+
+
+def test_a_missing_bucket_name_is_rejected():
+    with pytest.raises(StorageError, match="bucket"):
+        GCSStore("gs://")
+
+
+def test_the_missing_extra_is_named(monkeypatch, gcs_url):
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", None)
+    with pytest.raises(StorageError, match=r"quarantine-py\[gcs\]"):
+        GCSStore(gcs_url)
+
+
+# -- the record lifecycle ---------------------------------------------------
+
+
+def test_records_round_trip_through_the_bucket(gcs, gcs_url, module):
+    q = Quarantine(gcs_url, halt_after=None, report=False)
+    q.call(module.load, "bad")
+
+    assert gcs.exists()
+    assert gcs.count() == 1
+    record = gcs.get(1)
+    assert record.function == "load"
+    assert record.error == "cannot load bad"
+    assert record.load_call().item == "bad", "the pickled input survives the round trip"
+    assert "ValueError" in record.traceback_text()
+    assert "'bad'" in record.input_text()
+
+
+def test_a_failed_retry_updates_the_stored_record(gcs_url, gcs, module):
+    q = Quarantine(gcs_url, halt_after=None, report=False)
+    q.call(module.load, "bad")
+    assert q.retry().still_failing == [1]
+
+    fresh = GCSStore(gcs_url)  # a different process would see the update too
+    assert fresh.get(1).attempts == 2
+
+    module.FAIL_ON = set()
+    assert q.retry().recovered == [1]
+    assert fresh.count() == 0
+
+
+def test_known_bad_items_are_skipped_on_a_rerun(gcs_url, module):
+    first = Quarantine(gcs_url, halt_after=None, report=False)
+    first.call(module.load, "bad")
+    second = Quarantine(gcs_url, halt_after=None, report=False)
+    second.call(module.load, "bad")
+    assert second.stats.skipped == 1
+    assert GCSStore(gcs_url).count() == 1, "no duplicate record"
+
+
+def test_delete_and_clear(gcs, gcs_url, module):
+    q = Quarantine(gcs_url, halt_after=None, report=False)
+    q.call(module.load, "bad")
+    q.call(module.load, "worse")
+    gcs.delete(1)
+    assert [r.id for r in gcs.records()] == [2]
+    assert gcs.clear() == 1
+    assert gcs.count() == 0
+    assert not gcs.exists()
+
+
+def test_disk_bytes_counts_the_objects(gcs, gcs_url, module):
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+    assert gcs.disk_bytes() > 0
+
+
+# -- the commit protocol ------------------------------------------------------
+
+
+def test_a_half_written_record_is_invisible(gcs, gcs_url):
+    prefix = gcs_url.split(f"{BUCKET}/")[1]
+    _put_raw(f"{prefix}/0007/.claim")
+    _put_raw(f"{prefix}/0007/traceback.txt", b"partial")
+
+    assert gcs.count() == 0, "no meta.json means the record does not exist"
+    assert gcs.records() == []
+    with pytest.raises(StorageError, match="no record 7"):
+        gcs.get(7)
+
+
+def test_reindex_sweeps_half_written_records(gcs, gcs_url, module):
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+    prefix = gcs_url.split(f"{BUCKET}/")[1]
+    _put_raw(f"{prefix}/0009/.claim")
+
+    assert gcs.purge_temp() == 1
+    assert gcs.count() == 1, "committed records are untouched"
+    assert _list_raw(f"{prefix}/0009/") == [], "the debris is gone"
+
+
+def test_a_lost_claim_race_moves_to_the_next_id(gcs, gcs_url, module):
+    q = Quarantine(gcs_url, halt_after=None, report=False)
+    q.call(module.load, "bad")  # takes id 1
+    prefix = gcs_url.split(f"{BUCKET}/")[1]
+    # Another worker claims id 2 between our listing and our write.
+    _put_raw(f"{prefix}/0002/.claim")
+
+    q.call(module.load, "worse")
+    assert [r.id for r in GCSStore(gcs_url).records()] == [1, 3], "the loser took the next id"
+
+# -- the CLI against a bucket -------------------------------------------------
+
+
+def test_the_cli_works_against_a_bucket(gcs_url, module, capsys):
+    import json
+
+    from quarantine.cli import main
+
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+
+    assert main(["list", "--dir", gcs_url, "--json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)
+    assert row["error"] == "cannot load bad"
+
+    assert main(["stats", "--dir", gcs_url, "--json"]) == 0
+    stats = json.loads(capsys.readouterr().out)
+    assert stats["records"] == 1
+    assert stats["bytes"] > 0
+    assert stats["dir"] == gcs_url
+
+    assert main(["show", "1", "--dir", gcs_url]) == 0
+    shown = capsys.readouterr().out
+    assert "cannot load bad" in shown and "'bad'" in shown
+
+    module.FAIL_ON = set()
+    assert main(["retry", "--dir", gcs_url]) == 0
+    assert "1 recovered" in capsys.readouterr().out
+
+    assert main(["list", "--dir", gcs_url]) == 0
+    assert "Nothing quarantined" in capsys.readouterr().out
+
+
+def test_the_dashboard_reads_a_bucket(gcs_url, module):
+    from quarantine.ui import DashboardHandler
+
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+    saved = DashboardHandler.quarantine_dir
+    DashboardHandler.quarantine_dir = gcs_url
+    try:
+        handler = DashboardHandler.__new__(DashboardHandler)
+        page = handler._render_index()
+        assert "load" in page and "ValueError" in page
+        detail = handler._render_record(1)
+        assert "cannot load bad" in detail
+    finally:
+        DashboardHandler.quarantine_dir = saved
+
+
+# -- module-level api ---------------------------------------------------------
+
+
+def test_module_level_retry_takes_a_url(gcs_url, module):
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+    module.FAIL_ON = set()
+    result = retry(dir=gcs_url)
+    assert result.recovered == [1]
+
+
+def test_the_decorator_takes_a_url(gcs_url):
+    @quarantine(dir=gcs_url, halt_after=None, report=False)
+    def parse(item):
+        raise ValueError(f"nope: {item}")
+
+    parse({"id": 1})
+    assert GCSStore(gcs_url).count() == 1
