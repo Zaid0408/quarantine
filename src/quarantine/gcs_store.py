@@ -21,7 +21,6 @@ __all__ = ["GCSStore"]
  
 CLAIM_NAME = ".claim"
 MAX_ID_ATTEMPTS = 64
-_DELETE_BATCH = 100  # GCS recommends batching ~100 requests per client.batch()
  
 _INDEX_FIELDS = (
     "id",
@@ -67,7 +66,13 @@ class GCSStore(StorageBackend):
         self.bucket_name = bucket
         self.prefix = prefix.strip("/")
         self.problems: list[str] = []
-        self._client = storage.Client()
+        try:
+            self._client = storage.Client()
+        except Exception as exc:  # noqa: BLE001 - google-auth raises its own hierarchy here
+            raise StorageError(
+                f"cannot authenticate to Google Cloud Storage for {url}: {exc}. "
+                f"Set GOOGLE_APPLICATION_CREDENTIALS or run `gcloud auth application-default login`."
+            ) from exc
         self._bucket = self._client.bucket(bucket)
         self._precondition_failed = precondition_failed
         self._api_error = api_error
@@ -249,12 +254,11 @@ class GCSStore(StorageBackend):
     # -- deleting ---------------------------------------------------------
  
     def _delete_keys(self, keys: list[str]) -> None:
-        for start in range(0, len(keys), _DELETE_BATCH):
-            batch = keys[start : start + _DELETE_BATCH]
+         for key in keys:
             try:
-                with self._client.batch():
-                    for key in batch:
-                        self._bucket.blob(key).delete()
+                self._bucket.blob(key).delete()
+            except self._not_found:
+                continue
             except self._api_error as exc:
                 raise self._wrap("delete records", exc) from exc
  
