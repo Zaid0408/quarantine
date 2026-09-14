@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 import hashlib
 import json
@@ -7,7 +8,6 @@ import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from __future__ import annotations
 
 from .errors import StorageError
 from .serialize import Serialized
@@ -37,11 +37,11 @@ _INDEX_FIELDS = (
 
 def _import_gcs()-> tuple[ModuleType, type[Exception], type[Exception]]:
     try:
+        import google.cloud.storage as storage  # noqa: PLC0415
         from google.api_core.exceptions import ( 
             GoogleAPICallError,
             PreconditionFailed,
         )
-        from google.cloud import storage
     except ImportError as exc:
         raise StorageError(
             "the gcs:// backend needs google-cloud-storage, which is an optional extra: "
