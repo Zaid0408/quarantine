@@ -1,3 +1,34 @@
+"""The GCS storage backend: one shared quarantine for a fleet of workers.
+ 
+The record layout mirrors the local folder and the S3 backend exactly -
+per-record objects under ``gs://bucket/prefix/0001/...`` - but GCS's
+conditional-write primitive differs slightly from S3's, so it is adapted
+here (see ADR 0007, and ``s3_store.py`` for the sibling implementation):
+ 
+**Id allocation.** The local store claims an id by creating a directory,
+which is atomic; the S3 backend claims one with ``If-None-Match: *``. Here
+an id is claimed by uploading a zero-byte ``.claim`` object with
+``if_generation_match=0`` - GCS's "only write me if no live version of this
+object exists yet" precondition - so two workers can never both own an id;
+the loser gets a ``PreconditionFailed`` (412) and takes the next number.
+ 
+**The commit point.** ``meta.json`` is uploaded *last*, and readers ignore
+any record prefix that lacks it - so a reader can never observe a
+half-written record, and a crash mid-upload leaves invisible debris that
+``quarantine reindex`` sweeps.
+ 
+Reads are materialised into a per-URL cache directory under the system temp
+folder, so :class:`~quarantine.record.Record` objects behave exactly as they
+do locally - ``quarantine show``, ``debug``, ``retry`` and the dashboard all
+work unchanged against a bucket.
+ 
+Requires ``google-cloud-storage``: ``pip install "quarantine-py[gcs]"``.
+Credentials and project come from the standard Google auth chain
+(``GOOGLE_APPLICATION_CREDENTIALS``, gcloud ADC, or a service account
+attached to the runtime); the IAM permissions needed are documented in
+``docs/remote-storage.md``.
+"""
+
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 import hashlib
@@ -7,21 +38,20 @@ import tempfile
 import threading
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
 
 from .errors import StorageError
-from .serialize import Serialized
 from .record import META_NAME, TRACEBACK_NAME, Record
+from .serialize import Serialized
 from .store import StorageBackend, build_record
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from types import ModuleType
-    
+
 __all__ = ["GCSStore"]
- 
+
 CLAIM_NAME = ".claim"
 MAX_ID_ATTEMPTS = 64
- 
+
 _INDEX_FIELDS = (
     "id",
     "fingerprint",
@@ -38,8 +68,9 @@ _INDEX_FIELDS = (
 def _import_gcs()-> tuple[ModuleType, type[Exception], type[Exception]]:
     try:
         import google.cloud.storage as storage  # noqa: PLC0415
-        from google.api_core.exceptions import ( 
+        from google.api_core.exceptions import (
             GoogleAPICallError,
+            NotFound,
             PreconditionFailed,
         )
     except ImportError as exc:
@@ -47,13 +78,11 @@ def _import_gcs()-> tuple[ModuleType, type[Exception], type[Exception]]:
             "the gcs:// backend needs google-cloud-storage, which is an optional extra: "
             'pip install "quarantine-py[gcs]"'
         ) from exc
-    
-    return storage,PreconditionFailed, GoogleAPICallError
+    return storage,PreconditionFailed, GoogleAPICallError, NotFound 
 
 
 class GCSStore(StorageBackend):
-    "A Quarantine stored as per-record objects in a GCS bucket."
-    
+    """A Quarantine stored as per-record objects in a GCS bucket."""
     def __init__(self,url:str) -> None:
         if not url.startswith("gs://"):
             raise StorageError(f"not a gs:// URL: {url!r}")
@@ -61,7 +90,7 @@ class GCSStore(StorageBackend):
         bucket, _, prefix = rest.partition("/")
         if not bucket:
             raise StorageError(f"{url!r} is missing a bucket name (gs://bucket/prefix)")
-        storage, precondition_failed, api_error = _import_gcs()
+        storage, precondition_failed, api_error, not_found = _import_gcs()
         self.dir: str = url.rstrip("/")
         self.bucket_name = bucket
         self.prefix = prefix.strip("/")
@@ -75,6 +104,7 @@ class GCSStore(StorageBackend):
             ) from exc
         self._bucket = self._client.bucket(bucket)
         self._precondition_failed = precondition_failed
+        self._not_found= not_found
         self._api_error = api_error
         self._mutex = threading.Lock()
         self._id_hint = 0
