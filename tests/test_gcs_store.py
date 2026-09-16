@@ -61,9 +61,15 @@ pytestmark = [
 def module(target_module):
     return target_module(SOURCE, name="qtarget_gcs")
 
+
 @pytest.fixture
 def gcs_url(monkeypatch):
     """A real bucket on the emulator plus a unique prefix, so tests cannot see each other.
+
+    Unlike moto, fake-gcs-server is a real running process with no automatic
+    per-test reset, so the bucket persists across the whole session and
+    isolation comes entirely from the unique prefix - same as the S3 fixture's
+    belt-and-suspenders uuid, except here it's the only thing doing the work.
     """
     monkeypatch.setenv("STORAGE_EMULATOR_HOST", EMULATOR_HOST)
     client = _client()
@@ -75,6 +81,7 @@ def gcs_url(monkeypatch):
 @pytest.fixture
 def gcs(gcs_url):
     return GCSStore(gcs_url)
+
 
 def _client() -> storage.Client:
     """A raw client for asserting against/poking the emulator directly, bypassing GCSStore."""
@@ -235,6 +242,26 @@ def test_a_lost_claim_race_moves_to_the_next_id(gcs, gcs_url, module):
 
     q.call(module.load, "worse")
     assert [r.id for r in GCSStore(gcs_url).records()] == [1, 3], "the loser took the next id"
+
+
+def test_delete_keys_tolerates_a_vanished_object(gcs, gcs_url, module):
+    """A key another worker already deleted should not surface as a StorageError.
+
+    Unlike S3's `delete_objects`, GCS's `Blob.delete` raises `NotFound` for a key
+    that's already gone. `clear()`/`purge_temp()` list then delete as two separate
+    steps, so a concurrent deleter can legitimately win that race between them -
+    this exercises `_delete_keys` directly rather than trying to time a real race
+    against `_list_objects`, which isn't reliably reproducible against a live
+    server.
+    """
+    from quarantine.record import META_NAME
+
+    Quarantine(gcs_url, halt_after=None, report=False).call(module.load, "bad")
+    prefix = gcs_url.split(f"{BUCKET}/")[1]
+    key = f"{prefix}/0001/{META_NAME}"
+    _client().bucket(BUCKET).blob(key).delete()  # simulate another worker beating us to it
+
+    gcs._delete_keys([key])  # noqa: SLF001 - exercising the tolerance directly
 
 # -- the CLI against a bucket -------------------------------------------------
 
