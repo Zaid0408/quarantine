@@ -110,7 +110,7 @@ addopts = [
     "--strict-config",
     "--import-mode=importlib",
 ]
-filterwarnings = ["error","ignore:Type google._upb._message:DeprecationWarning"]
+filterwarnings = ["error","ignore:Type google._upb._message:DeprecationWarning","ignore:.*Google will stop supporting.*:FutureWarning:google.api_core.*"]
 asyncio_mode = "auto"
 xfail_strict = true
 markers = [
