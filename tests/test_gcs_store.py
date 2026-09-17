@@ -35,7 +35,7 @@ def load(item):
 def _emulator_reachable() -> bool:
     """Ping fake-gcs-server once; cached so every test doesn't pay the round trip."""
     try:
-        urllib.request.urlopen(f"{EMULATOR_HOST}/storage/v1/b", timeout=1)  # noqa: S310
+        urllib.request.urlopen(f"{EMULATOR_HOST}/storage/v1/b", timeout=1)
     except (urllib.error.URLError, ConnectionError, OSError):
         return False
     return True
@@ -44,9 +44,7 @@ def _emulator_reachable() -> bool:
 _EMULATOR_UP = _emulator_reachable()
 
 pytestmark = [
-    pytest.mark.filterwarnings(
-        "ignore:Type google._upb._message:DeprecationWarning"
-    ),
+    pytest.mark.filterwarnings("ignore:Type google._upb._message:DeprecationWarning"),
     pytest.mark.skipif(
         not _EMULATOR_UP,
         reason=(
@@ -261,7 +259,8 @@ def test_delete_keys_tolerates_a_vanished_object(gcs, gcs_url, module):
     key = f"{prefix}/0001/{META_NAME}"
     _client().bucket(BUCKET).blob(key).delete()  # simulate another worker beating us to it
 
-    gcs._delete_keys([key])  # noqa: SLF001 - exercising the tolerance directly
+    gcs._delete_keys([key])
+
 
 # -- the CLI against a bucket -------------------------------------------------
 
