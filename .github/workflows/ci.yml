@@ -57,16 +57,10 @@ jobs:
             curl -sf http://localhost:4443/storage/v1/b > /dev/null && break
             sleep 1
           done
-      # gcs_store.py can only be exercised where fake-gcs-server actually runs
-      # (Linux - see step above). macOS/Windows GitHub-hosted runners don't
-      # have a workable Docker Linux-container setup, so the GCS test file
-      # skips there by design; enforcing the repo-wide 90% floor on those
-      # runs would fail purely because of an untestable-there module, not a
-      # real regression. Linux keeps the full, strict threshold.
       - name: pytest
         run: >-
           pytest --cov --cov-report=xml --cov-report=term
-          ${{ runner.os != 'Linux' && '--cov-fail-under=0' || '' }}
+          ${{ runner.os != 'Linux' && '--cov-config=.coveragerc.nonlinux' || '' }}
         env:
           STORAGE_EMULATOR_HOST: http://localhost:4443
       - name: Upload coverage
