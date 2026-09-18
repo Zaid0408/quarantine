@@ -272,7 +272,7 @@ From then on `dir="mystore://…"` works everywhere a path does. Whatever the
 transport, keep the two promises: a reader never sees a partial record, and a
 failed write never silently loses one.
 
-GCS, Azure Blob, Redis and Databricks Unity Catalog volumes are planned as
+Azure Blob, Redis and Databricks Unity Catalog volumes are planned as
 further built-ins — see [ENHANCEMENTS.md](https://github.com/halcyon-past/quarantine/blob/main/ENHANCEMENTS.md);
 the interface above is how they will be built, and how you can build one
 sooner.
